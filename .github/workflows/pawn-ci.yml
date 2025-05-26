@@ -1,0 +1,172 @@
+name: Build open.mp Script (Dev & Release)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Tipo de Build'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - release
+      version_override:
+        description: 'Sobrescrever Versão (ex: v1.0.1-beta, para build_type=release)'
+        required: false
+
+jobs:
+  compile-pawn-script:
+    name: Compile Pawn Script
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    outputs:
+      amx_filename: ${{ steps.prepare_build_vars.outputs.amx_filename }}
+      artifact_name: ${{ steps.prepare_build_vars.outputs.artifact_name }}
+      is_release: ${{ steps.prepare_build_vars.outputs.is_release }}
+
+    steps:
+      - name: 🛎️ Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🛠️ Prepare Build Variables
+        id: prepare_build_vars
+        run: |
+          IS_RELEASE_BUILD="false"
+          BUILD_VERSION=""
+          COMPILER_DEBUG_LEVEL="-d2"
+          COMPILER_DEFINES="-DDEBUG_MODE"
+          AMX_BASENAME="main"
+          AMX_FILENAME_SUFFIX=".amx"
+
+          echo "GITHUB_REF_TYPE: ${GITHUB_REF_TYPE}"
+          echo "GITHUB_REF_NAME: ${GITHUB_REF_NAME}"
+          echo "Workflow event name: ${{ github.event_name }}"
+          echo "Workflow inputs.build_type: ${{ github.event.inputs.build_type }}"
+          echo "Workflow inputs.version_override: ${{ github.event.inputs.version_override }}"
+
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" && "${{ github.ref_name }}" == v* ]]; then
+            IS_RELEASE_BUILD="true"
+            BUILD_VERSION="${{ github.ref_name }}"
+            echo "Release build triggered by tag: ${BUILD_VERSION}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.build_type }}" == "release" ]]; then
+            IS_RELEASE_BUILD="true"
+            if [[ -n "${{ github.event.inputs.version_override }}" ]]; then
+              BUILD_VERSION="${{ github.event.inputs.version_override }}"
+            else
+              BUILD_VERSION="release-$(date +%Y%m%d%H%M%S)"
+            fi
+            echo "Release build triggered manually. Version: ${BUILD_VERSION}"
+          fi
+
+          if [[ "$IS_RELEASE_BUILD" == "true" ]]; then
+            COMPILER_DEBUG_LEVEL="-d1"
+            COMPILER_DEFINES=""
+            AMX_FILENAME_SUFFIX=".amx"
+            ARTIFACT_NAME="compiled-script-release-${BUILD_VERSION}"
+          else
+            BUILD_VERSION="dev-${GITHUB_SHA::7}"
+            ARTIFACT_NAME="compiled-script-dev-${GITHUB_SHA::7}"
+             echo "Development build. Version/ID: ${BUILD_VERSION}"
+          fi
+          
+          AMX_FILENAME="${AMX_BASENAME}${AMX_FILENAME_SUFFIX}"
+
+          echo "IS_RELEASE_BUILD=$IS_RELEASE_BUILD" >> $GITHUB_OUTPUT
+          echo "BUILD_VERSION=$BUILD_VERSION" >> $GITHUB_OUTPUT
+          echo "COMPILER_DEBUG_LEVEL=$COMPILER_DEBUG_LEVEL" >> $GITHUB_OUTPUT
+          echo "COMPILER_DEFINES=$COMPILER_DEFINES" >> $GITHUB_OUTPUT
+          echo "AMX_FILENAME=$AMX_FILENAME" >> $GITHUB_OUTPUT
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+          
+          echo "Final AMX Filename: $AMX_FILENAME"
+          echo "Final Artifact Name: $ARTIFACT_NAME"
+          echo "Compiler Defines: $COMPILER_DEFINES"
+
+      - name: 📁 Create Directories
+        run: |
+          mkdir -p ./compiler ./include ./dist
+          echo "Directories created: compiler/, include/, dist/"
+
+      - name: 🔽 Download Pawn Compiler
+        run: |
+          echo "Downloading Pawn compiler v3.10.10 for Linux..."
+          wget -q -O ./compiler/pawnc-linux.tar.gz https://github.com/pawn-lang/compiler/releases/download/v3.10.10/pawnc-3.10.10-linux.tar.gz
+          echo "Download complete."
+
+      - name: 📦 Extract Pawn Compiler
+        run: |
+          echo "Extracting compiler..."
+          tar -xzf ./compiler/pawnc-linux.tar.gz -C ./compiler/
+          COMPILER_EXECUTABLE="./compiler/pawnc-3.10.10-linux/bin/pawncc"
+          COMPILER_LIB_DIR="./compiler/pawnc-3.10.10-linux/lib"
+          chmod +x "$COMPILER_EXECUTABLE"
+          echo "COMPILER_EXECUTABLE=${COMPILER_EXECUTABLE}" >> $GITHUB_ENV
+          echo "COMPILER_LIB_DIR=${COMPILER_LIB_DIR}" >> $GITHUB_ENV
+          echo "✅ Compiler extracted and paths set."
+
+      - name: 📚 Clone omp-stdlib (Includes)
+        run: |
+          echo "Cloning openmultiplayer/omp-stdlib into ./include/ ..."
+          git clone --depth 1 https://github.com/openmultiplayer/omp-stdlib.git ./include/
+          echo "✅ omp-stdlib cloned."
+
+      - name: 🚀 Compile Script
+        env:
+          COMPILER_DEBUG_FLAGS: ${{ steps.prepare_build_vars.outputs.COMPILER_DEBUG_LEVEL }}
+          COMPILER_MACRO_DEFINES: ${{ steps.prepare_build_vars.outputs.COMPILER_DEFINES }}
+          FINAL_AMX_FILENAME: ${{ steps.prepare_build_vars.outputs.AMX_FILENAME }}
+        run: |
+          echo "Starting compilation..."
+          
+          SCRIPT_SOURCE_FILE="gamemodes/main.pwn"
+          OUTPUT_AMX_FILE_PATH="dist/${FINAL_AMX_FILENAME}"
+
+          echo "Using compiler: ${COMPILER_EXECUTABLE}"
+          echo "Source file: ${{ github.workspace }}/${SCRIPT_SOURCE_FILE}"
+          echo "Output AMX: ${OUTPUT_AMX_FILE_PATH}"
+          echo "Debug Flags: ${COMPILER_DEBUG_FLAGS}"
+          echo "Macro Defines: ${COMPILER_MACRO_DEFINES}"
+          echo "Include path: ${{ github.workspace }}/include/"
+          echo "LD_LIBRARY_PATH: ${COMPILER_LIB_DIR}:${LD_LIBRARY_PATH}"
+          
+          export LD_LIBRARY_PATH="${COMPILER_LIB_DIR}:${LD_LIBRARY_PATH}"
+
+          "${COMPILER_EXECUTABLE}" "${{ github.workspace }}/${SCRIPT_SOURCE_FILE}" \
+                                  -o"${{ github.workspace }}/${OUTPUT_AMX_FILE_PATH}" \
+                                  -i"${{ github.workspace }}/include/" \
+                                  ${COMPILER_DEBUG_FLAGS} \
+                                  ${COMPILER_MACRO_DEFINES}
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Compilation successful! Output: ${OUTPUT_AMX_FILE_PATH}"
+          else
+            echo "❌ Compilation failed."
+            exit 1
+          fi
+
+      - name: 📦 List Output Files
+        if: success()
+        run: |
+          echo "Listing contents of dist/ directory:"
+          ls -lhR ./dist
+
+      - name: 📤 Upload Compiled AMX
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare_build_vars.outputs.artifact_name }}
+          path: ./dist/${{ steps.prepare_build_vars.outputs.amx_filename }}
+          if-no-files-found: error
